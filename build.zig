@@ -6,6 +6,8 @@ pub fn build(b: *std.Build) void {
 
     if (target.result.cpu.arch.endian() != .little) @panic("tracy is only supported on little-endian architectures");
 
+    const build_profiler = b.option(bool, "profiler", "Build the profiler executable") orelse false;
+
     const strip_binary = b.option(bool, "strip", "Strip output binaries") orelse false;
     const build_shared = b.option(bool, "tracy_shared_libs", "Build tracy as a shared library") orelse false;
 
@@ -60,50 +62,22 @@ pub fn build(b: *std.Build) void {
         break :zstd_lib_blk lib;
     };
 
-    const server_lib = server_lib_blk: {
-        const lib = b.addStaticLibrary(.{
-            .name = "tracy-server",
-            .target = target,
-            .optimize = optimize,
-        });
-        lib.root_module.addCMacro("NO_PARALLEL_SORT", ""); // TODO: needs tbb dependency
-        // lib.root_module.addCMacro("TRACY_NO_STATISTICS", ""); // TODO: make this an option
-        lib.root_module.addCSourceFiles(.{
-            .root = b.path("upstream"),
-            .files = &.{
-                "public/common/tracy_lz4.cpp",
-                "public/common/tracy_lz4hc.cpp",
-                "public/common/TracySocket.cpp",
-                "public/common/TracyStackFrames.cpp",
-                "public/common/TracySystem.cpp",
-
-                "server/TracyMemory.cpp",
-                "server/TracyMmap.cpp",
-                "server/TracyPrint.cpp",
-                "server/TracySysUtil.cpp",
-                "server/TracyTaskDispatch.cpp",
-                "server/TracyTextureCompression.cpp",
-                "server/TracyThreadCompress.cpp",
-                "server/TracyWorker.cpp",
-            },
-            .flags = &base_cxx_flags,
-        });
-        lib.root_module.link_libc = true;
-        lib.root_module.link_libcpp = true;
-        lib.root_module.linkLibrary(capstone_lib);
-        lib.root_module.addIncludePath(getInstallRelativePath(b, capstone_lib, "capstone"));
-        lib.root_module.linkLibrary(zstd_lib);
-
-        break :server_lib_blk lib;
-    };
-
     const capture_exe = capture_exe_blk: {
+        const server_lib = buildServerLib(
+            b,
+            target,
+            optimize,
+            capstone_lib,
+            zstd_lib,
+            .{ .no_parallel_sort = true, .no_statistics = true },
+        );
         const exe = b.addExecutable(.{
             .name = "tracy-capture",
             .target = target,
             .optimize = optimize,
         });
         exe.root_module.addCMacro("NO_PARALLEL_SORT", ""); // TODO: needs tbb dependency
+        exe.root_module.addCMacro("TRACY_NO_STATISTICS", ""); // TODO: make this an option
         exe.root_module.addCSourceFiles(.{
             .root = b.path("upstream"),
             .files = &.{"capture/src/capture.cpp"},
@@ -115,6 +89,219 @@ pub fn build(b: *std.Build) void {
         break :capture_exe_blk exe;
     };
     _ = capture_exe; // autofix
+
+    if (build_profiler) {
+        const glfw_dep = b.dependency("glfw", .{ .target = target, .optimize = optimize }); // TODO: lazy dep
+        const glfw_lib = glfw_dep.artifact("glfw");
+
+        const imgui_lib = imgui_lib_blk: {
+            const lib = b.addStaticLibrary(.{
+                .name = "imgui",
+                .target = target,
+                .optimize = optimize,
+            });
+            lib.root_module.addCMacro("IMGUI_ENABLE_FREETYPE", "");
+            lib.root_module.addIncludePath(b.path("upstream/imgui"));
+            lib.root_module.addCSourceFiles(.{
+                .root = b.path("upstream"),
+                .files = &.{
+                    "imgui/imgui_widgets.cpp",
+                    "imgui/imgui_draw.cpp",
+                    "imgui/imgui_demo.cpp",
+                    "imgui/imgui.cpp",
+                    "imgui/imgui_tables.cpp",
+                    "imgui/misc/freetype/imgui_freetype.cpp",
+                },
+                .flags = &base_cxx_flags,
+            });
+            lib.root_module.link_libc = true;
+            lib.root_module.link_libcpp = true;
+            lib.root_module.linkSystemLibrary("freetype2", .{ .needed = true });
+            lib.root_module.linkLibrary(glfw_lib);
+
+            break :imgui_lib_blk lib;
+        };
+
+        const nfd_lib = nfd_lib_blk: {
+            const lib = b.addStaticLibrary(.{
+                .name = "nfd",
+                .target = target,
+                .optimize = optimize,
+            });
+            lib.root_module.addCSourceFiles(.{
+                .root = b.path("upstream"),
+                .files = &.{"nfd/nfd_portal.cpp"},
+                .flags = &base_cxx_flags,
+            });
+            lib.root_module.link_libc = true;
+            lib.root_module.link_libcpp = true;
+            lib.root_module.linkSystemLibrary("dbus-1", .{ .needed = true });
+
+            break :nfd_lib_blk lib;
+        };
+
+        const server_lib = buildServerLib(
+            b,
+            target,
+            optimize,
+            capstone_lib,
+            zstd_lib,
+            .{ .no_parallel_sort = true, .no_statistics = false },
+        );
+
+        const profiler_exe = profiler_exe_blk: {
+            const exe = b.addExecutable(.{
+                .name = "tracy-profiler",
+                .target = target,
+                .optimize = optimize,
+            });
+            exe.root_module.addCMacro("NO_PARALLEL_SORT", ""); // TODO: needs tbb dependency
+            exe.root_module.addIncludePath(b.path("upstream/imgui"));
+            exe.root_module.addIncludePath(b.path("upstream/profiler"));
+            exe.root_module.addIncludePath(b.path("upstream/server"));
+            exe.root_module.addCSourceFiles(.{
+                .root = b.path("upstream"),
+                .files = &.{
+                    "profiler/src/ini.c",
+                },
+                .flags = &base_c_flags,
+            });
+            exe.root_module.addCSourceFiles(.{
+                .root = b.path("upstream"),
+                .files = &.{
+                    "profiler/src/imgui/imgui_impl_opengl3.cpp",
+                    "profiler/src/ConnectionHistory.cpp",
+                    "profiler/src/Filters.cpp",
+                    "profiler/src/Fonts.cpp",
+                    "profiler/src/HttpRequest.cpp",
+                    "profiler/src/ImGuiContext.cpp",
+                    "profiler/src/IsElevated.cpp",
+                    "profiler/src/main.cpp",
+                    "profiler/src/ResolvService.cpp",
+                    "profiler/src/RunQueue.cpp",
+                    "profiler/src/WindowPosition.cpp",
+                    "profiler/src/winmain.cpp",
+                    "profiler/src/winmainArchDiscovery.cpp",
+
+                    "profiler/src/BackendGlfw.cpp",
+                    "profiler/src/imgui/imgui_impl_glfw.cpp",
+
+                    "profiler/src/profiler/TracyAchievementData.cpp",
+                    "profiler/src/profiler/TracyAchievements.cpp",
+                    "profiler/src/profiler/TracyBadVersion.cpp",
+                    "profiler/src/profiler/TracyColor.cpp",
+                    "profiler/src/profiler/TracyEventDebug.cpp",
+                    "profiler/src/profiler/TracyFileselector.cpp",
+                    "profiler/src/profiler/TracyFilesystem.cpp",
+                    "profiler/src/profiler/TracyImGui.cpp",
+                    "profiler/src/profiler/TracyMicroArchitecture.cpp",
+                    "profiler/src/profiler/TracyMouse.cpp",
+                    "profiler/src/profiler/TracyProtoHistory.cpp",
+                    "profiler/src/profiler/TracySourceContents.cpp",
+                    "profiler/src/profiler/TracySourceTokenizer.cpp",
+                    "profiler/src/profiler/TracySourceView.cpp",
+                    "profiler/src/profiler/TracyStorage.cpp",
+                    "profiler/src/profiler/TracyTexture.cpp",
+                    "profiler/src/profiler/TracyTimelineController.cpp",
+                    "profiler/src/profiler/TracyTimelineItem.cpp",
+                    "profiler/src/profiler/TracyTimelineItemCpuData.cpp",
+                    "profiler/src/profiler/TracyTimelineItemGpu.cpp",
+                    "profiler/src/profiler/TracyTimelineItemPlot.cpp",
+                    "profiler/src/profiler/TracyTimelineItemThread.cpp",
+                    "profiler/src/profiler/TracyUserData.cpp",
+                    "profiler/src/profiler/TracyUtility.cpp",
+                    "profiler/src/profiler/TracyView.cpp",
+                    "profiler/src/profiler/TracyView_Annotations.cpp",
+                    "profiler/src/profiler/TracyView_Callstack.cpp",
+                    "profiler/src/profiler/TracyView_Compare.cpp",
+                    "profiler/src/profiler/TracyView_ConnectionState.cpp",
+                    "profiler/src/profiler/TracyView_ContextSwitch.cpp",
+                    "profiler/src/profiler/TracyView_CpuData.cpp",
+                    "profiler/src/profiler/TracyView_FindZone.cpp",
+                    "profiler/src/profiler/TracyView_FrameOverview.cpp",
+                    "profiler/src/profiler/TracyView_FrameTimeline.cpp",
+                    "profiler/src/profiler/TracyView_FrameTree.cpp",
+                    "profiler/src/profiler/TracyView_GpuTimeline.cpp",
+                    "profiler/src/profiler/TracyView_Locks.cpp",
+                    "profiler/src/profiler/TracyView_Memory.cpp",
+                    "profiler/src/profiler/TracyView_Messages.cpp",
+                    "profiler/src/profiler/TracyView_Navigation.cpp",
+                    "profiler/src/profiler/TracyView_NotificationArea.cpp",
+                    "profiler/src/profiler/TracyView_Options.cpp",
+                    "profiler/src/profiler/TracyView_Playback.cpp",
+                    "profiler/src/profiler/TracyView_Plots.cpp",
+                    "profiler/src/profiler/TracyView_Ranges.cpp",
+                    "profiler/src/profiler/TracyView_Samples.cpp",
+                    "profiler/src/profiler/TracyView_Statistics.cpp",
+                    "profiler/src/profiler/TracyView_Timeline.cpp",
+                    "profiler/src/profiler/TracyView_TraceInfo.cpp",
+                    "profiler/src/profiler/TracyView_Utility.cpp",
+                    "profiler/src/profiler/TracyView_ZoneInfo.cpp",
+                    "profiler/src/profiler/TracyView_ZoneTimeline.cpp",
+                    "profiler/src/profiler/TracyWeb.cpp",
+                },
+                .flags = &base_cxx_flags,
+            });
+            exe.root_module.linkLibrary(server_lib);
+            exe.root_module.linkLibrary(imgui_lib);
+            exe.root_module.linkLibrary(nfd_lib);
+            exe.root_module.linkLibrary(capstone_lib);
+            exe.root_module.linkLibrary(glfw_lib);
+            exe.root_module.addIncludePath(getInstallRelativePath(b, capstone_lib, "capstone"));
+            if (strip_binary) exe.root_module.strip = true;
+            b.installArtifact(exe);
+
+            break :profiler_exe_blk exe;
+        };
+        _ = profiler_exe; // autofix
+    }
+}
+
+fn buildServerLib(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    capstone_lib: *std.Build.Step.Compile,
+    zstd_lib: *std.Build.Step.Compile,
+    opts: struct {
+        no_parallel_sort: bool,
+        no_statistics: bool,
+    },
+) *std.Build.Step.Compile {
+    const lib = b.addStaticLibrary(.{
+        .name = "tracy-server",
+        .target = target,
+        .optimize = optimize,
+    });
+    if (opts.no_parallel_sort) lib.root_module.addCMacro("NO_PARALLEL_SORT", "");
+    if (opts.no_statistics) lib.root_module.addCMacro("TRACY_NO_STATISTICS", "");
+    lib.root_module.addCSourceFiles(.{
+        .root = b.path("upstream"),
+        .files = &.{
+            "public/common/tracy_lz4.cpp",
+            "public/common/tracy_lz4hc.cpp",
+            "public/common/TracySocket.cpp",
+            "public/common/TracyStackFrames.cpp",
+            "public/common/TracySystem.cpp",
+
+            "server/TracyMemory.cpp",
+            "server/TracyMmap.cpp",
+            "server/TracyPrint.cpp",
+            "server/TracySysUtil.cpp",
+            "server/TracyTaskDispatch.cpp",
+            "server/TracyTextureCompression.cpp",
+            "server/TracyThreadCompress.cpp",
+            "server/TracyWorker.cpp",
+        },
+        .flags = &base_cxx_flags,
+    });
+    lib.root_module.link_libc = true;
+    lib.root_module.link_libcpp = true;
+    lib.root_module.linkLibrary(capstone_lib);
+    lib.root_module.addIncludePath(getInstallRelativePath(b, capstone_lib, "capstone"));
+    lib.root_module.linkLibrary(zstd_lib);
+
+    return lib;
 }
 
 const Options = blk: {
