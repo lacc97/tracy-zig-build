@@ -1,0 +1,13 @@
+.{
+    .name = "tracy",
+    .version = "0.0.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "lib",
+        "upstream",
+    },
+    .dependencies = .{
+        .capstone = .{ .path = "lib/capstone" },
+    },
+}
